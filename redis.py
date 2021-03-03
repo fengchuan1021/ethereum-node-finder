@@ -18,7 +18,7 @@ class Redis(object):
                 self.__class__._firstini=0
                 while 1:
                     try:
-                        self.redis = await aioredis.create_redis_pool('redis://127.0.0.1:6379/6')
+                        self.redis = await aioredis.create_redis_pool('redis://192.168.1.36:6379/6')
                         return self
                     except Exception as e:
                         await asyncio.sleep(3)

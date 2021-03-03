@@ -1,6 +1,5 @@
 #pip install pysha3
 #pip install eciespy
-#pip install devp2p #这个需要自定义安装包 requirements.txt 文件中miniupnp 依赖去掉
 #pip install netifaces
 import asyncio
 import socket
