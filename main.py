@@ -332,7 +332,8 @@ async def send(ipport, cmd_id, payload) -> bytes:
             print(ipport)
     return message
 if __name__=='__main__':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if os.name=='nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0',30303))
     loop = asyncio.get_event_loop()
