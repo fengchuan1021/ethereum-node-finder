@@ -33,6 +33,9 @@ MAC_SIZE = 256 // 8
 SIG_SIZE = 520 // 8  # 65
 HEAD_SIZE = MAC_SIZE + SIG_SIZE
 sem = asyncio.Semaphore(100) #一次最多同时连接查询100个节点
+
+
+
 def get_external_ipaddress() -> ipaddress.IPv4Address:
     for iface in netifaces.interfaces():
         for family, addresses in netifaces.ifaddresses(iface).items():
@@ -61,11 +64,13 @@ def init():
        f.write(eth_k.to_bytes())
     return eth_k
 eth_k=init()
-myid=eth_k.public_key.to_bytes()
 def keccak256(s):
     k = sha3.keccak_256()
     k.update(s)
     return k.digest()
+myid= keccak256(eth_k.public_key.to_bytes()).hex()
+
+
 
 
 sequence_number=111
@@ -152,59 +157,56 @@ async def sendlookuptonode(remote_publickey,remote_address):
     expiration = _get_msg_expiration()
     await send(remote_address, CMD_FIND_NODE, (target_key, expiration))
 
-async def recv_pong_v4(remote_publickey,remote_address, payload, _: Hash32) -> None:
+async def recv_pong_v4(remote_publickey,remote_address, payload, _: Hash32,db) -> None:
     # The pong payload should have at least 3 elements: to, token, expiration
     await sendlookuptonode(remote_publickey,remote_address)
 
-async def addtodb(arr):
-    global redis
-    pipe = redis.pipeline()
-    for node_id,ip,udp_port,pk in arr:
-        #print('len:',len(node_id))
-        pipe.hmset(f'hid:{node_id}', 'hostname', ip, 'port', udp_port,'pubkey',pk)
-        pipe.sadd('ids', node_id)
-    await pipe.execute()
 
-async def recv_neighbours_v4(remote_publickey,remote_address, payload, _: Hash32) -> None:
-    print('recv_neighbours_v4')
+
+async def addtodb(db,arr):
+    if arr:
+        sql = "insert ignore into ethereum (nodeid,ip,port,publickey) values (%s,%s,%s,%s)"
+        await db.executemany(sql,arr)
+
+import datetime
+async def recv_neighbours_v4(remote_publickey,remote_address, payload, _: Hash32,db) -> None:
+
     # The neighbours payload should have 2 elements: nodes, expiration
     if len(payload) < 2:
         print('neighbors wrong')
         return
     nodes, expiration = payload[:2]
     arr=[]
+    update_arr=[]
+    nodeid1=keccak256(remote_publickey.to_bytes()).hex()
+    tm = datetime.datetime.now()
     for item in nodes:
         try:
             ip, udp_port, tcp_port, publickey = item
             ip=ipaddress.ip_address(ip)
             udp_port=big_endian_to_int(udp_port)
             node_id=keccak256(publickey).hex()
-            arr.append([node_id,str(ip),udp_port,publickey])
+            update_arr.append([nodeid1,node_id,tm])
+            arr.append([node_id,str(ip),udp_port,publickey.hex()])
         except Exception as e:
             print(e)
             continue
     if arr:
-        await addtodb(arr)
+        await addtodb(db,arr)
+    if update_arr:
+
+        sql="insert into ethereum_neighbours (nodeid1,nodeid2,update_time) values (%s,%s,%s) ON DUPLICATE KEY UPDATE update_time=VALUES(update_time)"
+        await db.executemany(sql,update_arr)
 
 
 async def recv_ping_v4(
-        remotepk,remote_address, payload, message_hash: Hash32) -> None:
-    """Process a received ping packet.
+        remotepk,remote_address, payload, message_hash: Hash32,db) -> None:
 
-    A ping packet may come any time, unrequested, or may be prompted by us bond()ing with a
-    new node. In the former case we'll just reply with a pong, whereas in the latter we'll
-    also send an empty msg on the appropriate channel from ping_channels, to notify any
-    coroutine waiting for that ping.
-
-    Also, if we have no valid bond with the given remote, we'll trigger one in the background.
-    """
     targetnodeid = keccak256(remotepk.to_bytes())
-    if targetnodeid  == myid:
+    if targetnodeid.hex()  == myid:
         return
-    print('tarnode_id',len(targetnodeid.hex()))
-    await addtodb([[targetnodeid.hex(),remote_address[0],remote_address[1],remotepk.to_bytes()]])
-    # The ping payload should have at least 4 elements: [version, from, to, expiration], with
-    # an optional 5th element for the node's ENR sequence number.
+    print('ping insert',[targetnodeid.hex(),remote_address[0],remote_address[1],remotepk.to_bytes().hex()])
+    await addtodb(db,[[targetnodeid.hex(),remote_address[0],remote_address[1],remotepk.to_bytes().hex()]])
 
     if len(payload) < 4:
         print('error ping')
@@ -239,7 +241,7 @@ def _get_handler(cmd):
     elif cmd == CMD_ENR_RESPONSE:
         return None
 
-def _onrecv(sock):
+def _onrecv(sock,db):
     try:
         data,remoteaddr=sock.recvfrom(1280*2)
     except Exception as e:
@@ -255,7 +257,7 @@ def _onrecv(sock):
     if cmd_id not in [CMD_PING,CMD_PONG,CMD_NEIGHBOURS]:
         return
     handler = _get_handler(cmd_id)
-    asyncio.create_task(handler(remote_pubkey,remoteaddr,payload, message_hash))
+    asyncio.create_task(handler(remote_pubkey,remoteaddr,payload, message_hash,db))
     #await handler(remote_pubkey,remoteaddr,payload, message_hash)
 
 async def send_ping_v4(hostname,port):
@@ -270,58 +272,49 @@ async def send_ping_v4(hostname,port):
 
 async def inibootstrapnode(redis):
     ids=[]
+    arr=[]
     for nodeurl in BOOTNODES:
         node_parsed = urllib.parse.urlparse(nodeurl)
         raw_pubkey = binascii.unhexlify(node_parsed.username)
         hostname=node_parsed.hostname
         strid=keccak256(raw_pubkey).hex()
         hid='hid:'+strid
-        if not await redis.exists(hid):
-            await redis.hmset(hid,'pingtime',0,'hostname',hostname,'port',node_parsed.port,'pubkey',raw_pubkey)
-        ids.append(strid)
-    await redis.sadd('ids',*ids)
+        arr.append([strid,raw_pubkey.hex(),hostname,node_parsed.port,int(time.time())])
+    if arr:
+        sql="insert ignore into ethereum (nodeid,publickey,ip,port,pingtime) values (%s,%s,%s,%s,%s)"
+
+        await redis.executemany(sql,arr)
 async def find_node_to_ping(redis):
-    total = await redis.scard('ids')
-    pagesize = 200
-    for i in range(0, total, pagesize):
-        result = await redis.sort('ids', '#', 'hid:*->pingtime', 'hid:*->hostname', 'hid:*->port', by='hid:*->pingtime',offset=i, count=pagesize)
-        tasks = []
-        tmpids=[]
-        for i in range(len(result) // 4):
-            nodeid = result[i * 4]
-            pingtime = result[i * 4 + 1]
-            pingtime=0 if not pingtime else int(pingtime)
-            hostname = result[i * 4 + 2]
-            port = result[i * 4 + 3]
-            if int(time.time()) - pingtime > 3 * 60:
-                #print('lennodeid',len(nodeid))
-                tmpids.append(b'hid:'+nodeid)
-                if myid != nodeid:
-                    tasks.append(send_ping_v4(hostname.decode(), int(port)))
-            else:
-                break
+    nowtime=int(time.time())
+    sql=f"select id,nodeid,ip,port from ethereum where pingtime<{nowtime}"
+    result=await redis.execute(sql,1)
+    tmpid=[str(row[0]) for row in result]
+    if tmpid:
+        sql=f"update ethereum set pingtime={nowtime+300} where id in ({','.join(tmpid)})"
+        await redis.execute(sql)
+    tasks = []
+    for row in result:
+        nodeid = row[1]
+        ip= row[2]
+        port=row[3]
+        if myid != nodeid:
+            tasks.append(send_ping_v4(ip, int(port)))
+    if tasks:
+        await asyncio.wait(tasks)
 
-        if tasks:
-            pipe=redis.pipeline()
-            tm=int(time.time())
-            for id in tmpids:
-                pipe.hset(id,'pingtime',tm)
-            await pipe.execute()
-            await asyncio.wait(tasks)
-        else:
-            return
-async def main(redis):
+async def main(db):
     await inibootstrapnode(redis)
-
-
     while 1:
         await find_node_to_ping(redis)
         await asyncio.sleep(120)
-
+from db import Db
 async def getredis():
-    from redis import Redis
-    redis=await Redis()
-    return redis
+    dbconfig = {'sourcetable': 'ethereum', 'database': 'topo_p2p', 'databaseip': '192.168.1.36',
+                'databaseport': 3306, 'databaseuser': 'fengchuan', 'databasepassword': 'bOelm#Fb2aX', 'condition': '',
+                'conditionarr': []}
+    db=await Db(dbconfig)
+
+    return db
 async def send(ipport, cmd_id, payload) -> bytes:
     global eth_k,sock,sem
     async with sem:
@@ -332,13 +325,12 @@ async def send(ipport, cmd_id, payload) -> bytes:
             print(ipport)
     return message
 if __name__=='__main__':
-    if os.name=='nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0',30303))
     loop = asyncio.get_event_loop()
     redis=loop.run_until_complete(getredis())
-    loop.add_reader(sock, _onrecv,sock)
+    loop.add_reader(sock, _onrecv,sock,redis)
     loop.create_task(main(redis))
     #loop.create_task(sendmsg(redis,sock))
     loop.run_forever()
