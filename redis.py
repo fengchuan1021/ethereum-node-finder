@@ -1,4 +1,4 @@
-import aioredis,asyncio
+mport aioredis,asyncio
 class Redis(object):
     instance=None
     lock=None
